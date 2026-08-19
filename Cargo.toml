@@ -1,0 +1,21 @@
+[package]
+name = "ferx"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Reactive Extensions for async Rust"
+repository = "https://github.com/dasantos/ferx"
+readme = "README.md"
+keywords = ["reactive", "async", "rx", "observable", "tokio"]
+categories = ["asynchronous", "concurrency"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

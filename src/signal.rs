@@ -1,38 +1,38 @@
-/// The wire encoding used internally, and on the channel returned by
+/// The channel signal encoding used internally, and on the channel returned by
 /// [`Subject::sender`](crate::Subject::sender).
 ///
 /// - `Some(Ok(t))`: `OnNext`, deliver `t`.
 /// - `Some(Err(e))`: `OnError`, terminal.
 /// - `None`: `OnCompleted`, terminal.
-pub type WireSignal<T, E> = Option<Result<T, E>>;
+pub type ChannelSignal<T, E> = Option<Result<T, E>>;
 
-/// Returns whether a wire signal ends the sequence (`OnError` or `OnCompleted`).
-pub(crate) fn is_terminal<T, E>(wire: &WireSignal<T, E>) -> bool {
-    matches!(wire, None | Some(Err(_)))
+/// Returns whether a channel signal ends the sequence (`OnError` or `OnCompleted`).
+pub(crate) fn is_terminal<T, E>(channel_signal: &ChannelSignal<T, E>) -> bool {
+    matches!(channel_signal, None | Some(Err(_)))
 }
 
 /// A `Subject`'s recorded terminal state: it errored, or it completed.
-/// Never represents `OnNext`; unlike `WireSignal`, this can't be "not yet
+/// Never represents `OnNext`; unlike `ChannelSignal`, this can't be "not yet
 /// terminal", so a `Subject` can store "have I already ended, and how?"
 /// without an extra `Option` layer around a value that might be a next item.
 #[derive(Clone)]
-pub(crate) enum Terminal<E> {
+pub(crate) enum TerminalState<E> {
     Error(E),
     Complete,
 }
 
-impl<E: Clone> Terminal<E> {
-    pub(crate) fn to_wire<T>(&self) -> WireSignal<T, E> {
+impl<E: Clone> TerminalState<E> {
+    pub(crate) fn to_channel_signal<T>(&self) -> ChannelSignal<T, E> {
         match self {
-            Terminal::Error(e) => Some(Err(e.clone())),
-            Terminal::Complete => None,
+            TerminalState::Error(e) => Some(Err(e.clone())),
+            TerminalState::Complete => None,
         }
     }
 
     pub(crate) fn to_signal<T>(&self) -> Signal<T, E> {
         match self {
-            Terminal::Error(e) => Signal::Error(e.clone()),
-            Terminal::Complete => Signal::Complete,
+            TerminalState::Error(e) => Signal::Error(e.clone()),
+            TerminalState::Complete => Signal::Complete,
         }
     }
 }
@@ -67,20 +67,60 @@ pub(crate) fn run_guarded<R>(op: &'static str, f: impl FnOnce() -> R) -> Option<
 /// never both, and never another `Next` afterward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Signal<T, E> {
-    /// Delivers the next item in the sequence.
+    /// Delivers (emits) the next item in the sequence.
     Next(T),
-    /// Terminates the sequence with an error.
+    /// Terminates (notifies) the sequence with an error.
     Error(E),
-    /// Terminates the sequence successfully.
+    /// Terminates (notifies) the sequence successfully.
     Complete,
 }
 
-impl<T, E> From<WireSignal<T, E>> for Signal<T, E> {
-    fn from(wire: WireSignal<T, E>) -> Self {
+impl<T, E> From<ChannelSignal<T, E>> for Signal<T, E> {
+    fn from(wire: ChannelSignal<T, E>) -> Self {
         match wire {
             Some(Ok(t)) => Signal::Next(t),
             Some(Err(e)) => Signal::Error(e),
             None => Signal::Complete,
         }
+    }
+}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Determines what a new subscriber sees before joining a `Subject`'s
+/// live stream: nothing (`PublishSubject`), the last value (`BehaviorSubject`),
+/// everything so far (`ReplaySubject`), and so on. Sealed: [`NoReplay`] is
+/// the only implementation for now, matching today's `Subject` behavior.
+/// Not yet a supported extension point for downstream crates; hidden from
+/// docs because of that, even though it has to be `pub` for `Subject`'s
+/// defaulted generic parameter to type-check.
+#[doc(hidden)]
+pub trait SubjectPolicy<T>: sealed::Sealed {
+    /// Per-`Subject` state the policy keeps between emissions.
+    type Buffer: Default + Send;
+
+    /// Called once per accepted `OnNext`, before it's broadcast.
+    fn record(buffer: &mut Self::Buffer, value: &T);
+
+    /// What to replay to a subscriber joining right now.
+    fn replay(buffer: &Self::Buffer) -> Vec<T>;
+}
+
+/// No replay: a new subscriber sees nothing until the next live emission.
+/// This is `PublishSubject`'s behavior, and `Subject`'s default policy.
+#[doc(hidden)]
+pub struct NoReplay;
+
+impl sealed::Sealed for NoReplay {}
+
+impl<T: Clone> SubjectPolicy<T> for NoReplay {
+    type Buffer = ();
+
+    fn record(_buffer: &mut Self::Buffer, _value: &T) {}
+
+    fn replay(_buffer: &Self::Buffer) -> Vec<T> {
+        Vec::new()
     }
 }

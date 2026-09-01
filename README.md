@@ -95,14 +95,34 @@ Each operator spawns a background task that reads from the source subject and re
 
 ```rust
 let doubled: Subject<i32, String> = subject.map(16, |n| n * 2);
+// e.g. subject emits  1, 2, 3, 4, 5,  then completes
+//   -> doubled emits  2, 4, 6, 8, 10, then completes
+
 let evens: Subject<i32, String> = subject.filter(16, |n| n % 2 == 0);
+// e.g. subject emits 1, 2, 3, 4, 5, then completes
+//   -> evens emits      2,    4,    then completes
+
 let first_three: Subject<i32, String> = subject.take(16, 3);
+// e.g. subject emits     1, 2, 3, 4, 5, then completes
+//   -> first_three emits 1, 2, 3,       then completes (synthesized right after the 3rd item)
+
 let until_ten: Subject<i32, String> = subject.take_while(16, |n| *n < 10);
+// e.g. subject emits   1, 5, 9, 10, 2, then completes
+//   -> until_ten emits 1, 5, 9,        then completes (synthesized on the first failing value; 10 isn't forwarded)
+
 let after_first_two: Subject<i32, String> = subject.skip(16, 2);
+// e.g. subject emits         1, 2, 3, 4, 5, then completes
+//   -> after_first_two emits       3, 4, 5, then completes
+
 let combined: Subject<i32, String> = subject.merge(16, &other_subject);
+// e.g.       subject emits 1, 3       and completes; 
+//      other_subject emits 2, 4       and completes
+//   -> combined emits      1, 2, 3, 4 (interleaved by arrival order), then completes once both sources have
 ```
 
 The `capacity` argument sizes the new subject's internal channel; each operator stage allocates its own channel and task. `merge` completes once *both* sources have completed, and forwards an `OnError` from either side immediately.
+
+Each operator also has its own runnable example in the [rustdoc](https://docs.rs/ferx).
 
 ### `Observable<T, E>` (cold)
 

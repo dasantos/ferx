@@ -40,6 +40,10 @@ mod subscription;
 
 pub use error::SendError;
 pub use observable::Observable;
-pub use signal::{Signal, WireSignal};
+pub use signal::{ChannelSignal, Signal};
+// Hidden: required for `Subject`'s defaulted policy parameter to be
+// nameable, not yet a supported extension for downstream crates.
+#[doc(hidden)]
+pub use signal::{NoReplay, SubjectPolicy};
 pub use subject::Subject;
 pub use subscription::Subscription;

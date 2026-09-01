@@ -5,8 +5,10 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::SendError;
-use crate::signal::{Signal, Terminal, WireSignal, is_terminal, run_guarded};
-use crate::subscription::Subscription;
+use crate::signal::{
+    ChannelSignal, NoReplay, Signal, SubjectPolicy, TerminalState, is_terminal, run_guarded,
+};
+use crate::subscription::{Subscription, spawn_supervised};
 
 /// Aborts background operator tasks once no `Subject` clone references them
 /// anymore, so operator stages don't outlive their output handle.
@@ -23,18 +25,28 @@ impl Drop for TaskGuard {
 /// Whether a `Subject` has already ended, guarded by a single lock so
 /// "check terminal state" and "subscribe to the channel" (or "send") never
 /// race each other. Plain `std::sync::Mutex` is fine: critical sections are
-/// synchronous and tiny, never held across an `.await`.
-struct SubjectState<E> {
-    terminal: Option<Terminal<E>>,
+/// synchronous and tiny, never held across an `.await`. `Buf` is the
+/// `SubjectPolicy`'s replay buffer, guarded by the same lock so a replay
+/// read is always consistent with the terminal state at that instant.
+struct SubjectState<E, Buf> {
+    terminal: Option<TerminalState<E>>,
+    buffer: Buf,
 }
 
-/// Returned by `Subject::snapshot`: either a live receiver (subscribe before
-/// any future termination is observed), or the terminal signal the subject
+/// Returned by `Subject::snapshot`: replayed items (empty under the default
+/// [`NoReplay`] policy) plus either a live receiver (subscribe before any
+/// future termination is observed), or the terminal signal the subject
 /// already ended with; a receiver created now would never see it, since a
 /// `broadcast` channel doesn't replay history to new subscribers.
 pub(crate) enum SourceSnapshot<T, E> {
-    Live(broadcast::Receiver<WireSignal<T, E>>),
-    Terminated(Terminal<E>),
+    Live {
+        replay: Vec<T>,
+        receiver: broadcast::Receiver<ChannelSignal<T, E>>,
+    },
+    Terminated {
+        replay: Vec<T>,
+        terminal: TerminalState<E>,
+    },
 }
 
 /// A hot observable: values are emitted regardless of subscriber count, and
@@ -51,26 +63,26 @@ pub(crate) enum SourceSnapshot<T, E> {
 /// ```rust
 /// use ferx::Subject;
 ///
-/// # #[tokio::main]
-/// # async fn main() {
-/// let subject: Subject<i32, String> = Subject::new(16);
-/// let sub = subject.subscribe(|signal| println!("{signal:?}"));
+/// #[tokio::main]
+/// async fn main() {
+///     let subject: Subject<i32, String> = Subject::new(16);
+///     let sub = subject.subscribe(|signal| println!("{signal:?}"));
 ///
-/// subject.next(1).ok();
-/// subject.complete().ok();
-/// # tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-/// drop(sub);
-/// # }
+///     subject.next(1).ok();
+///     subject.complete().ok();
+///     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+///     drop(sub);
+/// }
 /// ```
-pub struct Subject<T, E> {
-    sender: broadcast::Sender<WireSignal<T, E>>,
-    state: Arc<Mutex<SubjectState<E>>>,
+pub struct Subject<T, E, P: SubjectPolicy<T> = NoReplay> {
+    sender: broadcast::Sender<ChannelSignal<T, E>>,
+    state: Arc<Mutex<SubjectState<E, P::Buffer>>>,
     // Shared so every clone keeps an operator-stage task alive; only the
     // last clone being dropped aborts it.
     task_guard: Option<Arc<TaskGuard>>,
 }
 
-impl<T, E> Clone for Subject<T, E> {
+impl<T, E, P: SubjectPolicy<T>> Clone for Subject<T, E, P> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
@@ -80,10 +92,11 @@ impl<T, E> Clone for Subject<T, E> {
     }
 }
 
-impl<T, E> Subject<T, E>
+impl<T, E, P> Subject<T, E, P>
 where
     T: Clone + Send + 'static,
     E: Clone + Send + 'static,
+    P: SubjectPolicy<T>,
 {
     /// Creates a new hot `Subject` with the given channel capacity.
     ///
@@ -95,7 +108,10 @@ where
         let (sender, _) = broadcast::channel(capacity);
         Self {
             sender,
-            state: Arc::new(Mutex::new(SubjectState { terminal: None })),
+            state: Arc::new(Mutex::new(SubjectState {
+                terminal: None,
+                buffer: P::Buffer::default(),
+            })),
             task_guard: None,
         }
     }
@@ -135,7 +151,7 @@ where
         self.send(None)
     }
 
-    fn send(&self, wire: WireSignal<T, E>) -> Result<usize, SendError> {
+    fn send(&self, wire: ChannelSignal<T, E>) -> Result<usize, SendError> {
         let mut state = self.state.lock().unwrap();
         if state.terminal.is_some() {
             // Already terminated: ignore further next()/error()/complete()
@@ -143,30 +159,38 @@ where
             return Ok(0);
         }
         match &wire {
-            Some(Err(e)) => state.terminal = Some(Terminal::Error(e.clone())),
-            None => state.terminal = Some(Terminal::Complete),
-            Some(Ok(_)) => {}
+            Some(Ok(t)) => P::record(&mut state.buffer, t),
+            Some(Err(e)) => state.terminal = Some(TerminalState::Error(e.clone())),
+            None => state.terminal = Some(TerminalState::Complete),
         }
         self.sender.send(wire).map_err(|_| SendError::NoReceivers)
     }
 
     /// Returns a clone of the underlying [`broadcast::Sender`], for direct
     /// use instead of [`next`](Subject::next)/[`error`](Subject::error)/
-    /// [`complete`](Subject::complete). See [`WireSignal`] for the value
+    /// [`complete`](Subject::complete). See [`ChannelSignal`] for the value
     /// type it carries. Sending through it bypasses this subject's
     /// terminal-state tracking.
-    pub fn sender(&self) -> broadcast::Sender<WireSignal<T, E>> {
+    pub fn sender(&self) -> broadcast::Sender<ChannelSignal<T, E>> {
         self.sender.clone()
     }
 
-    /// Atomically returns either a live receiver, or the terminal signal
-    /// this subject already ended with. Guarded by the same lock as `send`,
-    /// so nothing can terminate in the gap between the check and subscribing.
+    /// Atomically returns replayed items plus either a live receiver, or the
+    /// terminal signal this subject already ended with. Guarded by the same
+    /// lock as `send`, so nothing can terminate (or emit) in the gap between
+    /// the check and subscribing.
     pub(crate) fn snapshot(&self) -> SourceSnapshot<T, E> {
         let state = self.state.lock().unwrap();
+        let replay = P::replay(&state.buffer);
         match &state.terminal {
-            Some(terminal) => SourceSnapshot::Terminated(terminal.clone()),
-            None => SourceSnapshot::Live(self.sender.subscribe()),
+            Some(terminal) => SourceSnapshot::Terminated {
+                replay,
+                terminal: terminal.clone(),
+            },
+            None => SourceSnapshot::Live {
+                replay,
+                receiver: self.sender.subscribe(),
+            },
         }
     }
 
@@ -188,63 +212,72 @@ where
     /// on `RecvError::Lagged` handling). If the subject already terminated,
     /// the handler is invoked once with that terminal signal directly,
     /// since a receiver created now would never see it on the channel.
+    /// Any items the policy replays are delivered first, in order.
     pub fn subscribe_async<F, Fut>(&self, handler: F) -> Subscription
     where
         F: Fn(Signal<T, E>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let mut rx = match self.snapshot() {
-            SourceSnapshot::Terminated(terminal) => {
-                let handle = tokio::spawn(async move {
+        match self.snapshot() {
+            SourceSnapshot::Terminated { replay, terminal } => {
+                let abort = spawn_supervised(async move {
+                    for value in replay {
+                        handler(Signal::Next(value)).await;
+                    }
                     handler(terminal.to_signal()).await;
                 });
-                return Subscription {
+                Subscription {
                     cancel: None,
-                    handle: Some(handle),
-                };
+                    abort: Some(abort),
+                }
             }
-            SourceSnapshot::Live(rx) => rx,
-        };
-        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+            SourceSnapshot::Live { replay, receiver } => {
+                let mut rx = receiver;
+                let (cancel_tx, mut cancel_rx) = oneshot::channel();
 
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut cancel_rx => break,
-                    msg = rx.recv() => {
-                        match msg {
-                            Ok(wire) => {
-                                let terminal = is_terminal(&wire);
-                                handler(Signal::from(wire)).await;
-                                if terminal {
-                                    break;
+                let abort = spawn_supervised(async move {
+                    for value in replay {
+                        handler(Signal::Next(value)).await;
+                    }
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_rx => break,
+                            msg = rx.recv() => {
+                                match msg {
+                                    Ok(wire) => {
+                                        let terminal = is_terminal(&wire);
+                                        handler(Signal::from(wire)).await;
+                                        if terminal {
+                                            break;
+                                        }
+                                    }
+                                    // Lagged: terminate delivery for this subscriber rather
+                                    // than smuggle a transport error through the generic `E`.
+                                    Err(err @ broadcast::error::RecvError::Lagged(_)) => {
+                                        tracing::warn!(?err, "ferx: subscriber lagged; stopping delivery");
+                                        break;
+                                    }
+                                    // All senders (the Subject and its clones) were dropped
+                                    // without an explicit error()/complete() call, so this
+                                    // subscriber never gets a terminal Signal.
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        tracing::debug!(
+                                            "ferx: subject closed without an explicit terminal signal; stopping delivery"
+                                        );
+                                        break;
+                                    }
                                 }
-                            }
-                            // Lagged: terminate delivery for this subscriber rather
-                            // than smuggle a transport error through the generic `E`.
-                            Err(err @ broadcast::error::RecvError::Lagged(_)) => {
-                                tracing::warn!(?err, "ferx: subscriber lagged; stopping delivery");
-                                break;
-                            }
-                            // All senders (the Subject and its clones) were dropped
-                            // without an explicit error()/complete() call, so this
-                            // subscriber never gets a terminal Signal.
-                            Err(broadcast::error::RecvError::Closed) => {
-                                tracing::debug!(
-                                    "ferx: subject closed without an explicit terminal signal; stopping delivery"
-                                );
-                                break;
                             }
                         }
                     }
+                });
+
+                Subscription {
+                    cancel: Some(cancel_tx),
+                    abort: Some(abort),
                 }
             }
-        });
-
-        Subscription {
-            cancel: Some(cancel_tx),
-            handle: Some(handle),
         }
     }
 }

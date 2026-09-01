@@ -6,10 +6,10 @@ use futures_util::stream::unfold;
 use tokio::sync::oneshot;
 use tokio_stream::{Stream, StreamExt};
 
-use crate::signal::{Signal, WireSignal, is_terminal, run_guarded};
-use crate::subscription::Subscription;
+use crate::signal::{ChannelSignal, Signal, is_terminal, run_guarded};
+use crate::subscription::{Subscription, spawn_supervised};
 
-type BoxWireStream<T, E> = Pin<Box<dyn Stream<Item = WireSignal<T, E>> + Send>>;
+type BoxChannelStream<T, E> = Pin<Box<dyn Stream<Item = ChannelSignal<T, E>> + Send>>;
 
 /// A cold observable: the factory runs once per subscriber, giving each its
 /// own independent sequence from the start. Unlike [`Subject`](crate::Subject),
@@ -32,7 +32,7 @@ type BoxWireStream<T, E> = Pin<Box<dyn Stream<Item = WireSignal<T, E>> + Send>>;
 /// }
 /// ```
 pub struct Observable<T, E> {
-    factory: Arc<dyn Fn() -> BoxWireStream<T, E> + Send + Sync>,
+    factory: Arc<dyn Fn() -> BoxChannelStream<T, E> + Send + Sync>,
 }
 
 impl<T, E> Clone for Observable<T, E> {
@@ -48,12 +48,12 @@ where
     T: Send + 'static,
     E: Send + 'static,
 {
-    /// Wraps a factory that produces a fresh [`WireSignal`] stream for
+    /// Wraps a factory that produces a fresh [`ChannelSignal`] stream for
     /// each subscriber.
     pub fn new<F, S>(factory: F) -> Self
     where
         F: Fn() -> S + Send + Sync + 'static,
-        S: Stream<Item = WireSignal<T, E>> + Send + 'static,
+        S: Stream<Item = ChannelSignal<T, E>> + Send + 'static,
     {
         Self {
             factory: Arc::new(move || Box::pin(factory())),
@@ -80,16 +80,16 @@ where
         let mut stream = (self.factory)();
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
 
-        let handle = tokio::spawn(async move {
+        let abort = spawn_supervised(async move {
             loop {
                 tokio::select! {
                     biased;
                     _ = &mut cancel_rx => break,
                     item = stream.next() => {
                         match item {
-                            Some(wire) => {
-                                let terminal = is_terminal(&wire);
-                                handler(Signal::from(wire)).await;
+                            Some(channel_state) => {
+                                let terminal = is_terminal(&channel_state);
+                                handler(Signal::from(channel_state)).await;
                                 if terminal {
                                     break;
                                 }
@@ -104,7 +104,7 @@ where
 
         Subscription {
             cancel: Some(cancel_tx),
-            handle: Some(handle),
+            abort: Some(abort),
         }
     }
 
@@ -115,10 +115,10 @@ where
         let inner = (self.factory)();
         unfold(Some(inner), |state| async move {
             let mut inner = state?;
-            let wire = inner.next().await?;
-            let terminal = is_terminal(&wire);
+            let channel_state = inner.next().await?;
+            let terminal = is_terminal(&channel_state);
             let next_state = if terminal { None } else { Some(inner) };
-            Some((Signal::from(wire), next_state))
+            Some((Signal::from(channel_state), next_state))
         })
     }
 }

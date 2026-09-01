@@ -339,3 +339,118 @@ async fn map_survives_a_panicking_closure() {
     let got = store.lock().unwrap().clone();
     assert_eq!(got, vec![Signal::Next(10)]);
 }
+
+#[tokio::test]
+async fn lagged_subscriber_stops_without_hanging() {
+    let subject: Subject<i32, String> = Subject::new(1);
+    let (store, push) = collector();
+    let _sub = subject.subscribe(push);
+
+    // The subscriber task is spawned but never polled until we `.await`
+    // below, so on this single-threaded test runtime these three sends all
+    // land before it ever calls `recv()`. With capacity 1, that guarantees
+    // it lags on its very first receive.
+    subject.next(1).unwrap();
+    subject.next(2).unwrap();
+    subject.next(3).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Lagged is terminal: the subscriber gets nothing (not even a stale
+    // value), and its task ends promptly instead of hanging.
+    let got = store.lock().unwrap().clone();
+    assert!(
+        got.is_empty(),
+        "lagged subscriber should receive nothing, got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn lagged_map_source_stops_that_stage_without_hanging() {
+    let subject: Subject<i32, String> = Subject::new(1);
+    let mapped = subject.map(1, |n| n * 2);
+    let (store, push) = collector();
+    let _sub = mapped.subscribe(push);
+
+    // Same reasoning as `lagged_subscriber_stops_without_hanging`, but for
+    // the `map` stage's own receiver on `subject`.
+    subject.next(1).unwrap();
+    subject.next(2).unwrap();
+    subject.next(3).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let got = store.lock().unwrap().clone();
+    assert!(
+        got.is_empty(),
+        "lagged map stage should forward nothing, got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn subscribe_async_panic_does_not_crash_the_process() {
+    let subject: Subject<i32, String> = Subject::new(16);
+    let sub = subject.subscribe_async(|signal| async move {
+        if let Signal::Next(2) = signal {
+            panic!("boom");
+        }
+    });
+
+    subject.next(1).unwrap();
+    subject.next(2).unwrap(); // panics inside the async handler
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // The panic is contained to that task (logged via the supervisor in
+    // spawn_supervised); reaching this point at all is the assertion.
+    drop(sub);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_emit_subscribe_and_terminate_is_race_free() {
+    // Not loom: ferx's races live in tokio primitives (broadcast, watch,
+    // select!), which loom doesn't model. This stress-tests the same
+    // Mutex-guarded snapshot/send window with real OS-thread parallelism
+    // instead, across many iterations, checking the Rx grammar
+    // (Next* (Error | Complete)?) holds for every subscriber every time.
+    for _ in 0..100 {
+        let subject: Subject<i32, String> = Subject::new(64);
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for i in 0..8 {
+            let subject = subject.clone();
+            tasks.spawn(async move {
+                subject.next(i).ok();
+            });
+        }
+        let terminator = subject.clone();
+        tasks.spawn(async move {
+            terminator.complete().ok();
+        });
+
+        let mut subscribers = Vec::new();
+        for _ in 0..4 {
+            let (store, push) = collector();
+            let sub = subject.subscribe(push);
+            subscribers.push((store, sub));
+        }
+
+        while tasks.join_next().await.is_some() {}
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        for (store, _sub) in &subscribers {
+            let got = store.lock().unwrap().clone();
+            let terminal_count = got
+                .iter()
+                .filter(|s| matches!(s, Signal::Complete | Signal::Error(_)))
+                .count();
+            assert!(
+                terminal_count <= 1,
+                "saw multiple terminal signals: {got:?}"
+            );
+            if let Some(pos) = got
+                .iter()
+                .position(|s| matches!(s, Signal::Complete | Signal::Error(_)))
+            {
+                assert_eq!(pos, got.len() - 1, "terminal signal wasn't last: {got:?}");
+            }
+        }
+    }
+}

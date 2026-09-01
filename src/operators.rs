@@ -6,22 +6,22 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::signal::{Terminal, WireSignal, run_guarded};
+use crate::signal::{ChannelSignal, TerminalState, run_guarded};
 use crate::subject::{SourceSnapshot, Subject};
 
 /// Spawns a task that immediately forwards an already-recorded terminal
 /// signal into `out_sender`, for operator stages built on an already-ended
 /// source.
 fn spawn_immediate_terminal<T, E>(
-    out_sender: broadcast::Sender<WireSignal<T, E>>,
-    terminal: Terminal<E>,
+    out_sender: broadcast::Sender<ChannelSignal<T, E>>,
+    terminal: TerminalState<E>,
 ) -> JoinHandle<()>
 where
     T: Send + 'static,
     E: Clone + Send + 'static,
 {
     tokio::spawn(async move {
-        let _ = out_sender.send(terminal.to_wire());
+        let _ = out_sender.send(terminal.to_channel_signal());
     })
 }
 
@@ -32,6 +32,23 @@ where
 {
     /// Transforms each `OnNext` value with `f`. `OnError`/`OnCompleted` pass
     /// through unchanged. `capacity` sizes the output subject's channel.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ferx::Subject;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let source: Subject<i32, String> = Subject::new(16);
+    ///     let doubled = source.map(16, |n| n * 2);
+    ///
+    ///     let sub = doubled.subscribe(|signal| println!("{signal:?}"));
+    ///     source.next(21).ok(); // delivers Signal::Next(42)
+    ///     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    ///     drop(sub);
+    /// }
+    /// ```
     pub fn map<U, F>(&self, capacity: usize, f: F) -> Subject<U, E>
     where
         U: Clone + Send + 'static,
@@ -41,12 +58,12 @@ where
         let out_sender = out.sender();
 
         let rx = match self.snapshot() {
-            SourceSnapshot::Terminated(terminal) => {
+            SourceSnapshot::Terminated { terminal, .. } => {
                 let handle = spawn_immediate_terminal(out_sender, terminal);
                 out.attach_task(handle);
                 return out;
             }
-            SourceSnapshot::Live(rx) => rx,
+            SourceSnapshot::Live { receiver, .. } => receiver,
         };
         let mut stream = BroadcastStream::new(rx);
 
@@ -58,14 +75,14 @@ where
                     );
                     break;
                 };
-                let wire = match item {
-                    Ok(wire) => wire,
+                let channel_state = match item {
+                    Ok(channel_state) => channel_state,
                     Err(err) => {
                         tracing::warn!(?err, "ferx: map source lagged; stopping this stage");
                         break;
                     }
                 };
-                let mapped: WireSignal<U, E> = match wire {
+                let mapped: ChannelSignal<U, E> = match channel_state {
                     Some(Ok(t)) => match run_guarded("map", || f(t)) {
                         Some(u) => Some(Ok(u)),
                         None => break, // closure panicked, already logged
@@ -86,6 +103,24 @@ where
 
     /// Keeps only `OnNext` values matching `predicate`. `OnError`/`OnCompleted`
     /// pass through unchanged. `capacity` sizes the output subject's channel.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ferx::Subject;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let source: Subject<i32, String> = Subject::new(16);
+    ///     let evens = source.filter(16, |n| n % 2 == 0);
+    ///
+    ///     let sub = evens.subscribe(|signal| println!("{signal:?}"));
+    ///     source.next(1).ok(); // filtered out
+    ///     source.next(2).ok(); // delivers Signal::Next(2)
+    ///     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    ///     drop(sub);
+    /// }
+    /// ```
     pub fn filter<F>(&self, capacity: usize, predicate: F) -> Subject<T, E>
     where
         F: Fn(&T) -> bool + Send + 'static,
@@ -94,12 +129,12 @@ where
         let out_sender = out.sender();
 
         let rx = match self.snapshot() {
-            SourceSnapshot::Terminated(terminal) => {
+            SourceSnapshot::Terminated { terminal, .. } => {
                 let handle = spawn_immediate_terminal(out_sender, terminal);
                 out.attach_task(handle);
                 return out;
             }
-            SourceSnapshot::Live(rx) => rx,
+            SourceSnapshot::Live { receiver, .. } => receiver,
         };
         let mut stream = BroadcastStream::new(rx);
 
@@ -111,14 +146,14 @@ where
                     );
                     break;
                 };
-                let wire = match item {
-                    Ok(wire) => wire,
+                let channel_state = match item {
+                    Ok(channel_state) => channel_state,
                     Err(err) => {
                         tracing::warn!(?err, "ferx: filter source lagged; stopping this stage");
                         break;
                     }
                 };
-                match wire {
+                match channel_state {
                     Some(Ok(t)) => match run_guarded("filter", || predicate(&t)) {
                         Some(true) => {
                             if out_sender.send(Some(Ok(t))).is_err() {
@@ -142,6 +177,25 @@ where
 
     /// Forwards the first `n` `OnNext` values, then synthesizes `OnCompleted`
     /// and stops, regardless of whether the source keeps emitting.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ferx::Subject;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let source: Subject<i32, String> = Subject::new(16);
+    ///     let first_two = source.take(16, 2);
+    ///
+    ///     let sub = first_two.subscribe(|signal| println!("{signal:?}"));
+    ///     source.next(1).ok();
+    ///     source.next(2).ok();
+    ///     source.next(3).ok(); // never delivered; first_two already completed
+    ///     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    ///     drop(sub);
+    /// }
+    /// ```
     pub fn take(&self, capacity: usize, n: usize) -> Subject<T, E> {
         let mut out = Subject::new(capacity);
         let out_sender = out.sender();
@@ -155,12 +209,12 @@ where
         }
 
         let rx = match self.snapshot() {
-            SourceSnapshot::Terminated(terminal) => {
+            SourceSnapshot::Terminated { terminal, .. } => {
                 let handle = spawn_immediate_terminal(out_sender, terminal);
                 out.attach_task(handle);
                 return out;
             }
-            SourceSnapshot::Live(rx) => rx,
+            SourceSnapshot::Live { receiver, .. } => receiver,
         };
         let mut stream = BroadcastStream::new(rx);
         let handle = tokio::spawn(async move {
@@ -172,14 +226,14 @@ where
                     );
                     break;
                 };
-                let wire = match item {
-                    Ok(wire) => wire,
+                let channel_state = match item {
+                    Ok(channel_state) => channel_state,
                     Err(err) => {
                         tracing::warn!(?err, "ferx: take source lagged; stopping this stage");
                         break;
                     }
                 };
-                match wire {
+                match channel_state {
                     Some(Ok(t)) => {
                         remaining -= 1;
                         let done = remaining == 0;
@@ -207,6 +261,24 @@ where
     /// that fails it, synthesizes `OnCompleted` (without forwarding that
     /// value) and stops. `OnError`/`OnCompleted` from the source pass
     /// through unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ferx::Subject;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let source: Subject<i32, String> = Subject::new(16);
+    ///     let until_ten = source.take_while(16, |n| *n < 10);
+    ///
+    ///     let sub = until_ten.subscribe(|signal| println!("{signal:?}"));
+    ///     source.next(5).ok(); // delivers Signal::Next(5)
+    ///     source.next(10).ok(); // fails predicate; completes instead
+    ///     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    ///     drop(sub);
+    /// }
+    /// ```
     pub fn take_while<F>(&self, capacity: usize, predicate: F) -> Subject<T, E>
     where
         F: Fn(&T) -> bool + Send + 'static,
@@ -215,12 +287,12 @@ where
         let out_sender = out.sender();
 
         let rx = match self.snapshot() {
-            SourceSnapshot::Terminated(terminal) => {
+            SourceSnapshot::Terminated { terminal, .. } => {
                 let handle = spawn_immediate_terminal(out_sender, terminal);
                 out.attach_task(handle);
                 return out;
             }
-            SourceSnapshot::Live(rx) => rx,
+            SourceSnapshot::Live { receiver, .. } => receiver,
         };
         let mut stream = BroadcastStream::new(rx);
 
@@ -232,14 +304,14 @@ where
                     );
                     break;
                 };
-                let wire = match item {
-                    Ok(wire) => wire,
+                let channel_state = match item {
+                    Ok(channel_state) => channel_state,
                     Err(err) => {
                         tracing::warn!(?err, "ferx: take_while source lagged; stopping this stage");
                         break;
                     }
                 };
-                match wire {
+                match channel_state {
                     Some(Ok(t)) => match run_guarded("take_while", || predicate(&t)) {
                         Some(true) => {
                             if out_sender.send(Some(Ok(t))).is_err() {
@@ -266,17 +338,36 @@ where
 
     /// Drops the first `n` `OnNext` values, then forwards the rest.
     /// `OnError`/`OnCompleted` from the source pass through unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ferx::Subject;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let source: Subject<i32, String> = Subject::new(16);
+    ///     let after_first_two = source.skip(16, 2);
+    ///
+    ///     let sub = after_first_two.subscribe(|signal| println!("{signal:?}"));
+    ///     source.next(1).ok(); // dropped
+    ///     source.next(2).ok(); // dropped
+    ///     source.next(3).ok(); // delivers Signal::Next(3)
+    ///     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    ///     drop(sub);
+    /// }
+    /// ```
     pub fn skip(&self, capacity: usize, n: usize) -> Subject<T, E> {
         let mut out = Subject::new(capacity);
         let out_sender = out.sender();
 
         let rx = match self.snapshot() {
-            SourceSnapshot::Terminated(terminal) => {
+            SourceSnapshot::Terminated { terminal, .. } => {
                 let handle = spawn_immediate_terminal(out_sender, terminal);
                 out.attach_task(handle);
                 return out;
             }
-            SourceSnapshot::Live(rx) => rx,
+            SourceSnapshot::Live { receiver, .. } => receiver,
         };
         let mut stream = BroadcastStream::new(rx);
 
@@ -289,14 +380,14 @@ where
                     );
                     break;
                 };
-                let wire = match item {
-                    Ok(wire) => wire,
+                let channel_state = match item {
+                    Ok(channel_state) => channel_state,
                     Err(err) => {
                         tracing::warn!(?err, "ferx: skip source lagged; stopping this stage");
                         break;
                     }
                 };
-                match wire {
+                match channel_state {
                     Some(Ok(t)) => {
                         if remaining > 0 {
                             remaining -= 1;
@@ -321,6 +412,25 @@ where
     /// Combines this subject with `other`, forwarding `OnNext` from both.
     /// The output completes once *both* sources have completed; an `OnError`
     /// from either source is forwarded immediately and ends the merge.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ferx::Subject;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let a: Subject<i32, String> = Subject::new(16);
+    ///     let b: Subject<i32, String> = Subject::new(16);
+    ///     let combined = a.merge(16, &b);
+    ///
+    ///     let sub = combined.subscribe(|signal| println!("{signal:?}"));
+    ///     a.next(1).ok();
+    ///     b.next(2).ok();
+    ///     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    ///     drop(sub);
+    /// }
+    /// ```
     pub fn merge(&self, capacity: usize, other: &Subject<T, E>) -> Subject<T, E> {
         let mut out = Subject::new(capacity);
         let out_sender = out.sender();
@@ -354,7 +464,7 @@ where
 
 fn spawn_merge_arm<T, E>(
     snapshot: SourceSnapshot<T, E>,
-    out_sender: broadcast::Sender<WireSignal<T, E>>,
+    out_sender: broadcast::Sender<ChannelSignal<T, E>>,
     remaining: Arc<AtomicUsize>,
     mut terminated_rx: watch::Receiver<bool>,
     terminated_tx: watch::Sender<bool>,
@@ -365,10 +475,13 @@ where
 {
     tokio::spawn(async move {
         let mut rx = match snapshot {
-            SourceSnapshot::Live(rx) => rx,
+            SourceSnapshot::Live { receiver, .. } => receiver,
             // The source already ended before this merge arm started; settle
             // this arm's contribution immediately instead of listening forever.
-            SourceSnapshot::Terminated(Terminal::Error(e)) => {
+            SourceSnapshot::Terminated {
+                terminal: TerminalState::Error(e),
+                ..
+            } => {
                 let is_first = terminated_tx.send_if_modified(|done| {
                     if *done {
                         false
@@ -382,7 +495,10 @@ where
                 }
                 return;
             }
-            SourceSnapshot::Terminated(Terminal::Complete) => {
+            SourceSnapshot::Terminated {
+                terminal: TerminalState::Complete,
+                ..
+            } => {
                 if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
                     let _ = out_sender.send(None);
                 }

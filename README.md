@@ -1,5 +1,7 @@
 # FeRx
 
+[![codecov](https://codecov.io/gh/dasantos/ferx/graph/badge.svg)](https://codecov.io/gh/dasantos/ferx)
+
 Reactive Extensions for async Rust: a (hot) observable (`Subject`) with operator composition, typed errors, and deterministic subscription cleanup, built on `tokio::sync::broadcast` and `futures`/`tokio-stream`.
 
 ## Why ferx?

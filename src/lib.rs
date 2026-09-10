@@ -7,12 +7,15 @@
 //! # Example
 //!
 //! ```rust
+//! use std::num::NonZeroUsize;
+//!
 //! use ferx::{Signal, Subject};
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let source: Subject<i32, String> = Subject::new(16);
-//!     let evens = source.filter(16, |n| n % 2 == 0);
+//!     let capacity = NonZeroUsize::new(16).unwrap();
+//!     let source: Subject<i32, String> = Subject::new(capacity);
+//!     let evens = source.filter(capacity, |n| n % 2 == 0);
 //!
 //!     let sub = evens.subscribe(|signal| match signal {
 //!         Signal::Next(n) => println!("next: {n}"),

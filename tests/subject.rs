@@ -1,7 +1,12 @@
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferx::{Signal, Subject};
+
+fn cap(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).unwrap()
+}
 
 fn collector<T: Send + 'static>() -> (Arc<Mutex<Vec<T>>>, impl Fn(T) + Send + 'static) {
     let store = Arc::new(Mutex::new(Vec::new()));
@@ -12,7 +17,7 @@ fn collector<T: Send + 'static>() -> (Arc<Mutex<Vec<T>>>, impl Fn(T) + Send + 's
 
 #[tokio::test]
 async fn subject_delivers_next_and_complete() {
-    let subject: Subject<i32, String> = Subject::new(16);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
     let (store, push) = collector();
     let _sub = subject.subscribe(push);
 
@@ -29,8 +34,33 @@ async fn subject_delivers_next_and_complete() {
 }
 
 #[tokio::test]
+async fn late_subscribe_to_operator_output_after_it_completed() {
+    let source: Subject<i32, String> = Subject::new(cap(16));
+    let mapped = source.map(cap(16), |n| n);
+
+    source.next(1).unwrap();
+    source.complete().unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await; // let map's task forward Complete
+
+    // `mapped` must remember it ended too, not just `source`: a subscriber
+    // arriving after the operator stage itself completed still needs the
+    // stored terminal signal, matching the same contract plain Subjects
+    // give late subscribers.
+    let (store, push) = collector();
+    let _sub = mapped.subscribe(push);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let got = store.lock().unwrap().clone();
+    assert_eq!(
+        got,
+        vec![Signal::Complete],
+        "late subscriber to mapped saw: {got:?}"
+    );
+}
+
+#[tokio::test]
 async fn late_subscriber_immediately_receives_stored_completion() {
-    let subject: Subject<i32, String> = Subject::new(16);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
     subject.next(1).ok();
     subject.complete().ok();
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -47,7 +77,7 @@ async fn late_subscriber_immediately_receives_stored_completion() {
 
 #[tokio::test]
 async fn late_subscriber_immediately_receives_stored_error() {
-    let subject: Subject<i32, String> = Subject::new(16);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
     subject.error("boom".to_string()).ok();
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -61,7 +91,7 @@ async fn late_subscriber_immediately_receives_stored_error() {
 
 #[tokio::test]
 async fn next_after_termination_is_ignored() {
-    let subject: Subject<i32, String> = Subject::new(16);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
     let (store, push) = collector();
     let _sub = subject.subscribe(push);
 
@@ -77,11 +107,11 @@ async fn next_after_termination_is_ignored() {
 
 #[tokio::test]
 async fn map_of_an_already_terminated_source_forwards_immediately() {
-    let subject: Subject<i32, String> = Subject::new(16);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
     subject.error("boom".to_string()).ok();
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let mapped = subject.map(16, |n| n * 2);
+    let mapped = subject.map(cap(16), |n| n * 2);
     let (store, push) = collector();
     let _sub = mapped.subscribe(push);
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -92,7 +122,7 @@ async fn map_of_an_already_terminated_source_forwards_immediately() {
 
 #[tokio::test]
 async fn error_terminates_the_sequence() {
-    let subject: Subject<i32, String> = Subject::new(16);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
     let (store, push) = collector();
     let _sub = subject.subscribe(push);
 
@@ -110,8 +140,8 @@ async fn error_terminates_the_sequence() {
 
 #[tokio::test]
 async fn map_transforms_next_and_passes_terminal_through() {
-    let subject: Subject<i32, String> = Subject::new(16);
-    let mapped = subject.map(16, |n| n * 10);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
+    let mapped = subject.map(cap(16), |n| n * 10);
     let (store, push) = collector();
     let _sub = mapped.subscribe(push);
 
@@ -129,8 +159,8 @@ async fn map_transforms_next_and_passes_terminal_through() {
 
 #[tokio::test]
 async fn filter_drops_non_matching_and_passes_terminal_through() {
-    let subject: Subject<i32, String> = Subject::new(16);
-    let evens = subject.filter(16, |n| n % 2 == 0);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
+    let evens = subject.filter(cap(16), |n| n % 2 == 0);
     let (store, push) = collector();
     let _sub = evens.subscribe(push);
 
@@ -149,7 +179,7 @@ async fn filter_drops_non_matching_and_passes_terminal_through() {
 
 #[tokio::test]
 async fn dropping_subscription_stops_further_delivery() {
-    let subject: Subject<i32, String> = Subject::new(16);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
     let (store, push) = collector();
     let sub = subject.subscribe(push);
 
@@ -169,8 +199,8 @@ async fn dropping_subscription_stops_further_delivery() {
 
 #[tokio::test]
 async fn dropping_mapped_subject_aborts_its_background_task() {
-    let subject: Subject<i32, String> = Subject::new(16);
-    let mapped = subject.map(16, |n| n * 2);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
+    let mapped = subject.map(cap(16), |n| n * 2);
 
     assert_eq!(subject.sender().receiver_count(), 1); // map's own receiver
     drop(mapped);
@@ -179,16 +209,10 @@ async fn dropping_mapped_subject_aborts_its_background_task() {
     assert_eq!(subject.sender().receiver_count(), 0);
 }
 
-#[test]
-#[should_panic(expected = "capacity must be greater than 0")]
-fn zero_capacity_panics() {
-    let _: Subject<i32, String> = Subject::new(0);
-}
-
 #[tokio::test]
 async fn take_stops_after_n_and_synthesizes_complete() {
-    let subject: Subject<i32, String> = Subject::new(16);
-    let taken = subject.take(16, 2);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
+    let taken = subject.take(cap(16), 2);
     let (store, push) = collector();
     let _sub = taken.subscribe(push);
 
@@ -207,8 +231,8 @@ async fn take_stops_after_n_and_synthesizes_complete() {
 
 #[tokio::test]
 async fn take_zero_completes_immediately() {
-    let subject: Subject<i32, String> = Subject::new(16);
-    let taken = subject.take(16, 0);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
+    let taken = subject.take(cap(16), 0);
     let (store, push) = collector();
     let _sub = taken.subscribe(push);
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -219,8 +243,8 @@ async fn take_zero_completes_immediately() {
 
 #[tokio::test]
 async fn take_while_stops_at_first_failing_value() {
-    let subject: Subject<i32, String> = Subject::new(16);
-    let taken = subject.take_while(16, |n| *n < 3);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
+    let taken = subject.take_while(cap(16), |n| *n < 3);
     let (store, push) = collector();
     let _sub = taken.subscribe(push);
 
@@ -238,8 +262,8 @@ async fn take_while_stops_at_first_failing_value() {
 
 #[tokio::test]
 async fn skip_drops_first_n_and_forwards_the_rest() {
-    let subject: Subject<i32, String> = Subject::new(16);
-    let skipped = subject.skip(16, 2);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
+    let skipped = subject.skip(cap(16), 2);
     let (store, push) = collector();
     let _sub = skipped.subscribe(push);
 
@@ -258,9 +282,9 @@ async fn skip_drops_first_n_and_forwards_the_rest() {
 
 #[tokio::test]
 async fn merge_forwards_both_sources_and_completes_after_both() {
-    let a: Subject<i32, String> = Subject::new(16);
-    let b: Subject<i32, String> = Subject::new(16);
-    let merged = a.merge(16, &b);
+    let a: Subject<i32, String> = Subject::new(cap(16));
+    let b: Subject<i32, String> = Subject::new(cap(16));
+    let merged = a.merge(cap(16), &b);
     let (store, push) = collector();
     let _sub = merged.subscribe(push);
 
@@ -283,9 +307,9 @@ async fn merge_forwards_both_sources_and_completes_after_both() {
 
 #[tokio::test]
 async fn merge_forwards_error_from_either_side_immediately() {
-    let a: Subject<i32, String> = Subject::new(16);
-    let b: Subject<i32, String> = Subject::new(16);
-    let merged = a.merge(16, &b);
+    let a: Subject<i32, String> = Subject::new(cap(16));
+    let b: Subject<i32, String> = Subject::new(cap(16));
+    let merged = a.merge(cap(16), &b);
     let (store, push) = collector();
     let _sub = merged.subscribe(push);
 
@@ -306,9 +330,9 @@ async fn merge_forwards_error_from_either_side_immediately() {
 
 #[tokio::test]
 async fn merge_losing_arm_stops_listening_after_error() {
-    let a: Subject<i32, String> = Subject::new(16);
-    let b: Subject<i32, String> = Subject::new(16);
-    let merged = a.merge(16, &b);
+    let a: Subject<i32, String> = Subject::new(cap(16));
+    let b: Subject<i32, String> = Subject::new(cap(16));
+    let merged = a.merge(cap(16), &b);
     let _sub = merged.subscribe(|_: Signal<i32, String>| {});
 
     b.error("boom".to_string()).unwrap();
@@ -321,11 +345,9 @@ async fn merge_losing_arm_stops_listening_after_error() {
 
 #[tokio::test]
 async fn map_survives_a_panicking_closure() {
-    let subject: Subject<i32, String> = Subject::new(16);
-    let mapped = subject.map(16, |n| {
-        if n == 2 {
-            panic!("boom");
-        }
+    let subject: Subject<i32, String> = Subject::new(cap(16));
+    let mapped = subject.map(cap(16), |n| {
+        assert!(n != 2, "boom");
         n * 10
     });
     let (store, push) = collector();
@@ -342,7 +364,7 @@ async fn map_survives_a_panicking_closure() {
 
 #[tokio::test]
 async fn lagged_subscriber_stops_without_hanging() {
-    let subject: Subject<i32, String> = Subject::new(1);
+    let subject: Subject<i32, String> = Subject::new(cap(1));
     let (store, push) = collector();
     let _sub = subject.subscribe(push);
 
@@ -366,8 +388,8 @@ async fn lagged_subscriber_stops_without_hanging() {
 
 #[tokio::test]
 async fn lagged_map_source_stops_that_stage_without_hanging() {
-    let subject: Subject<i32, String> = Subject::new(1);
-    let mapped = subject.map(1, |n| n * 2);
+    let subject: Subject<i32, String> = Subject::new(cap(1));
+    let mapped = subject.map(cap(1), |n| n * 2);
     let (store, push) = collector();
     let _sub = mapped.subscribe(push);
 
@@ -387,7 +409,7 @@ async fn lagged_map_source_stops_that_stage_without_hanging() {
 
 #[tokio::test]
 async fn subscribe_async_panic_does_not_crash_the_process() {
-    let subject: Subject<i32, String> = Subject::new(16);
+    let subject: Subject<i32, String> = Subject::new(cap(16));
     let sub = subject.subscribe_async(|signal| async move {
         if let Signal::Next(2) = signal {
             panic!("boom");
@@ -411,7 +433,7 @@ async fn concurrent_emit_subscribe_and_terminate_is_race_free() {
     // instead, across many iterations, checking the Rx grammar
     // (Next* (Error | Complete)?) holds for every subscriber every time.
     for _ in 0..100 {
-        let subject: Subject<i32, String> = Subject::new(64);
+        let subject: Subject<i32, String> = Subject::new(cap(64));
         let mut tasks = tokio::task::JoinSet::new();
 
         for i in 0..8 {

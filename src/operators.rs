@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -5,24 +6,31 @@ use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tracing::Instrument;
 
-use crate::signal::{ChannelSignal, TerminalState, run_guarded};
+use crate::signal::{ChannelSignal, TerminalState, is_terminal, run_guarded};
 use crate::subject::{SourceSnapshot, Subject};
 
 /// Spawns a task that immediately forwards an already-recorded terminal
-/// signal into `out_sender`, for operator stages built on an already-ended
-/// source.
+/// signal into `out`, for operator stages built on an already-ended
+/// source. Goes through `Subject::send` (not the raw channel) so `out`'s
+/// own terminal-state lock stays in sync with what's on the channel.
 fn spawn_immediate_terminal<T, E>(
-    out_sender: broadcast::Sender<ChannelSignal<T, E>>,
+    op: &'static str,
+    out: Subject<T, E>,
     terminal: TerminalState<E>,
 ) -> JoinHandle<()>
 where
-    T: Send + 'static,
+    T: Clone + Send + 'static,
     E: Clone + Send + 'static,
 {
-    tokio::spawn(async move {
-        let _ = out_sender.send(terminal.to_channel_signal());
-    })
+    let span = tracing::debug_span!("ferx_operator", op, subject = out.id);
+    tokio::spawn(
+        async move {
+            let _ = out.send(terminal.to_channel_signal());
+        }
+        .instrument(span),
+    )
 }
 
 impl<T, E> Subject<T, E>
@@ -36,12 +44,15 @@ where
     /// # Examples
     ///
     /// ```rust
+    /// use std::num::NonZeroUsize;
+    ///
     /// use ferx::Subject;
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let source: Subject<i32, String> = Subject::new(16);
-    ///     let doubled = source.map(16, |n| n * 2);
+    ///     let capacity = NonZeroUsize::new(16).unwrap();
+    ///     let source: Subject<i32, String> = Subject::new(capacity);
+    ///     let doubled = source.map(capacity, |n| n * 2);
     ///
     ///     let sub = doubled.subscribe(|signal| println!("{signal:?}"));
     ///     source.next(21).ok(); // delivers Signal::Next(42)
@@ -49,17 +60,17 @@ where
     ///     drop(sub);
     /// }
     /// ```
-    pub fn map<U, F>(&self, capacity: usize, f: F) -> Subject<U, E>
+    #[must_use]
+    pub fn map<U, F>(&self, capacity: NonZeroUsize, f: F) -> Subject<U, E>
     where
         U: Clone + Send + 'static,
         F: Fn(T) -> U + Send + 'static,
     {
         let mut out = Subject::new(capacity);
-        let out_sender = out.sender();
 
         let rx = match self.snapshot() {
             SourceSnapshot::Terminated { terminal, .. } => {
-                let handle = spawn_immediate_terminal(out_sender, terminal);
+                let handle = spawn_immediate_terminal("map", out.clone(), terminal);
                 out.attach_task(handle);
                 return out;
             }
@@ -67,7 +78,14 @@ where
         };
         let mut stream = BroadcastStream::new(rx);
 
-        let handle = tokio::spawn(async move {
+        let span = tracing::debug_span!(
+            "ferx_operator",
+            op = "map",
+            subject = out.id,
+            source = self.id
+        );
+        let out_task = out.clone();
+        let fut = async move {
             loop {
                 let Some(item) = stream.next().await else {
                     tracing::debug!(
@@ -90,13 +108,17 @@ where
                     Some(Err(e)) => Some(Err(e)),
                     None => None,
                 };
-                let terminal = mapped.is_none() || matches!(mapped, Some(Err(_)));
-                if out_sender.send(mapped).is_err() || terminal {
+                let terminal = is_terminal(&mapped);
+                // A send error here just means no one's listening right now
+                // (a normal state for a hot multicast); only a genuine
+                // terminal signal ends this stage.
+                let _ = out_task.send(mapped);
+                if terminal {
                     break;
                 }
             }
-        });
-        out.attach_task(handle);
+        };
+        out.attach_task(tokio::spawn(fut.instrument(span)));
 
         out
     }
@@ -107,12 +129,15 @@ where
     /// # Examples
     ///
     /// ```rust
+    /// use std::num::NonZeroUsize;
+    ///
     /// use ferx::Subject;
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let source: Subject<i32, String> = Subject::new(16);
-    ///     let evens = source.filter(16, |n| n % 2 == 0);
+    ///     let capacity = NonZeroUsize::new(16).unwrap();
+    ///     let source: Subject<i32, String> = Subject::new(capacity);
+    ///     let evens = source.filter(capacity, |n| n % 2 == 0);
     ///
     ///     let sub = evens.subscribe(|signal| println!("{signal:?}"));
     ///     source.next(1).ok(); // filtered out
@@ -121,16 +146,16 @@ where
     ///     drop(sub);
     /// }
     /// ```
-    pub fn filter<F>(&self, capacity: usize, predicate: F) -> Subject<T, E>
+    #[must_use]
+    pub fn filter<F>(&self, capacity: NonZeroUsize, predicate: F) -> Self
     where
         F: Fn(&T) -> bool + Send + 'static,
     {
-        let mut out = Subject::new(capacity);
-        let out_sender = out.sender();
+        let mut out = Self::new(capacity);
 
         let rx = match self.snapshot() {
             SourceSnapshot::Terminated { terminal, .. } => {
-                let handle = spawn_immediate_terminal(out_sender, terminal);
+                let handle = spawn_immediate_terminal("filter", out.clone(), terminal);
                 out.attach_task(handle);
                 return out;
             }
@@ -138,7 +163,14 @@ where
         };
         let mut stream = BroadcastStream::new(rx);
 
-        let handle = tokio::spawn(async move {
+        let span = tracing::debug_span!(
+            "ferx_operator",
+            op = "filter",
+            subject = out.id,
+            source = self.id
+        );
+        let out_task = out.clone();
+        let fut = async move {
             loop {
                 let Some(item) = stream.next().await else {
                     tracing::debug!(
@@ -156,21 +188,19 @@ where
                 match channel_state {
                     Some(Ok(t)) => match run_guarded("filter", || predicate(&t)) {
                         Some(true) => {
-                            if out_sender.send(Some(Ok(t))).is_err() {
-                                break;
-                            }
+                            let _ = out_task.send(Some(Ok(t)));
                         }
-                        Some(false) => continue, // filtered out, do not forward
-                        None => break,           // predicate panicked, already logged
+                        Some(false) => {} // filtered out, do not forward
+                        None => break,    // predicate panicked, already logged
                     },
                     other => {
-                        let _ = out_sender.send(other);
+                        let _ = out_task.send(other);
                         break;
                     }
                 }
             }
-        });
-        out.attach_task(handle);
+        };
+        out.attach_task(tokio::spawn(fut.instrument(span)));
 
         out
     }
@@ -181,12 +211,15 @@ where
     /// # Examples
     ///
     /// ```rust
+    /// use std::num::NonZeroUsize;
+    ///
     /// use ferx::Subject;
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let source: Subject<i32, String> = Subject::new(16);
-    ///     let first_two = source.take(16, 2);
+    ///     let capacity = NonZeroUsize::new(16).unwrap();
+    ///     let source: Subject<i32, String> = Subject::new(capacity);
+    ///     let first_two = source.take(capacity, 2);
     ///
     ///     let sub = first_two.subscribe(|signal| println!("{signal:?}"));
     ///     source.next(1).ok();
@@ -196,28 +229,45 @@ where
     ///     drop(sub);
     /// }
     /// ```
-    pub fn take(&self, capacity: usize, n: usize) -> Subject<T, E> {
-        let mut out = Subject::new(capacity);
-        let out_sender = out.sender();
+    #[must_use]
+    pub fn take(&self, capacity: NonZeroUsize, n: usize) -> Self {
+        let mut out = Self::new(capacity);
 
         if n == 0 {
-            let handle = tokio::spawn(async move {
-                let _ = out_sender.send(None);
-            });
+            let span = tracing::debug_span!(
+                "ferx_operator",
+                op = "take",
+                subject = out.id,
+                source = self.id
+            );
+            let out_task = out.clone();
+            let handle = tokio::spawn(
+                async move {
+                    let _ = out_task.send(None);
+                }
+                .instrument(span),
+            );
             out.attach_task(handle);
             return out;
         }
 
         let rx = match self.snapshot() {
             SourceSnapshot::Terminated { terminal, .. } => {
-                let handle = spawn_immediate_terminal(out_sender, terminal);
+                let handle = spawn_immediate_terminal("take", out.clone(), terminal);
                 out.attach_task(handle);
                 return out;
             }
             SourceSnapshot::Live { receiver, .. } => receiver,
         };
         let mut stream = BroadcastStream::new(rx);
-        let handle = tokio::spawn(async move {
+        let span = tracing::debug_span!(
+            "ferx_operator",
+            op = "take",
+            subject = out.id,
+            source = self.id
+        );
+        let out_task = out.clone();
+        let fut = async move {
             let mut remaining = n;
             loop {
                 let Some(item) = stream.next().await else {
@@ -237,22 +287,20 @@ where
                     Some(Ok(t)) => {
                         remaining -= 1;
                         let done = remaining == 0;
-                        if out_sender.send(Some(Ok(t))).is_err() {
-                            break;
-                        }
+                        let _ = out_task.send(Some(Ok(t)));
                         if done {
-                            let _ = out_sender.send(None);
+                            let _ = out_task.send(None);
                             break;
                         }
                     }
                     other => {
-                        let _ = out_sender.send(other);
+                        let _ = out_task.send(other);
                         break;
                     }
                 }
             }
-        });
-        out.attach_task(handle);
+        };
+        out.attach_task(tokio::spawn(fut.instrument(span)));
 
         out
     }
@@ -265,12 +313,15 @@ where
     /// # Examples
     ///
     /// ```rust
+    /// use std::num::NonZeroUsize;
+    ///
     /// use ferx::Subject;
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let source: Subject<i32, String> = Subject::new(16);
-    ///     let until_ten = source.take_while(16, |n| *n < 10);
+    ///     let capacity = NonZeroUsize::new(16).unwrap();
+    ///     let source: Subject<i32, String> = Subject::new(capacity);
+    ///     let until_ten = source.take_while(capacity, |n| *n < 10);
     ///
     ///     let sub = until_ten.subscribe(|signal| println!("{signal:?}"));
     ///     source.next(5).ok(); // delivers Signal::Next(5)
@@ -279,16 +330,16 @@ where
     ///     drop(sub);
     /// }
     /// ```
-    pub fn take_while<F>(&self, capacity: usize, predicate: F) -> Subject<T, E>
+    #[must_use]
+    pub fn take_while<F>(&self, capacity: NonZeroUsize, predicate: F) -> Self
     where
         F: Fn(&T) -> bool + Send + 'static,
     {
-        let mut out = Subject::new(capacity);
-        let out_sender = out.sender();
+        let mut out = Self::new(capacity);
 
         let rx = match self.snapshot() {
             SourceSnapshot::Terminated { terminal, .. } => {
-                let handle = spawn_immediate_terminal(out_sender, terminal);
+                let handle = spawn_immediate_terminal("take_while", out.clone(), terminal);
                 out.attach_task(handle);
                 return out;
             }
@@ -296,7 +347,14 @@ where
         };
         let mut stream = BroadcastStream::new(rx);
 
-        let handle = tokio::spawn(async move {
+        let span = tracing::debug_span!(
+            "ferx_operator",
+            op = "take_while",
+            subject = out.id,
+            source = self.id
+        );
+        let out_task = out.clone();
+        let fut = async move {
             loop {
                 let Some(item) = stream.next().await else {
                     tracing::debug!(
@@ -314,24 +372,22 @@ where
                 match channel_state {
                     Some(Ok(t)) => match run_guarded("take_while", || predicate(&t)) {
                         Some(true) => {
-                            if out_sender.send(Some(Ok(t))).is_err() {
-                                break;
-                            }
+                            let _ = out_task.send(Some(Ok(t)));
                         }
                         Some(false) => {
-                            let _ = out_sender.send(None);
+                            let _ = out_task.send(None);
                             break;
                         }
                         None => break, // predicate panicked, already logged
                     },
                     other => {
-                        let _ = out_sender.send(other);
+                        let _ = out_task.send(other);
                         break;
                     }
                 }
             }
-        });
-        out.attach_task(handle);
+        };
+        out.attach_task(tokio::spawn(fut.instrument(span)));
 
         out
     }
@@ -342,12 +398,15 @@ where
     /// # Examples
     ///
     /// ```rust
+    /// use std::num::NonZeroUsize;
+    ///
     /// use ferx::Subject;
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let source: Subject<i32, String> = Subject::new(16);
-    ///     let after_first_two = source.skip(16, 2);
+    ///     let capacity = NonZeroUsize::new(16).unwrap();
+    ///     let source: Subject<i32, String> = Subject::new(capacity);
+    ///     let after_first_two = source.skip(capacity, 2);
     ///
     ///     let sub = after_first_two.subscribe(|signal| println!("{signal:?}"));
     ///     source.next(1).ok(); // dropped
@@ -357,13 +416,13 @@ where
     ///     drop(sub);
     /// }
     /// ```
-    pub fn skip(&self, capacity: usize, n: usize) -> Subject<T, E> {
-        let mut out = Subject::new(capacity);
-        let out_sender = out.sender();
+    #[must_use]
+    pub fn skip(&self, capacity: NonZeroUsize, n: usize) -> Self {
+        let mut out = Self::new(capacity);
 
         let rx = match self.snapshot() {
             SourceSnapshot::Terminated { terminal, .. } => {
-                let handle = spawn_immediate_terminal(out_sender, terminal);
+                let handle = spawn_immediate_terminal("skip", out.clone(), terminal);
                 out.attach_task(handle);
                 return out;
             }
@@ -371,7 +430,14 @@ where
         };
         let mut stream = BroadcastStream::new(rx);
 
-        let handle = tokio::spawn(async move {
+        let span = tracing::debug_span!(
+            "ferx_operator",
+            op = "skip",
+            subject = out.id,
+            source = self.id
+        );
+        let out_task = out.clone();
+        let fut = async move {
             let mut remaining = n;
             loop {
                 let Some(item) = stream.next().await else {
@@ -393,18 +459,16 @@ where
                             remaining -= 1;
                             continue;
                         }
-                        if out_sender.send(Some(Ok(t))).is_err() {
-                            break;
-                        }
+                        let _ = out_task.send(Some(Ok(t)));
                     }
                     other => {
-                        let _ = out_sender.send(other);
+                        let _ = out_task.send(other);
                         break;
                     }
                 }
             }
-        });
-        out.attach_task(handle);
+        };
+        out.attach_task(tokio::spawn(fut.instrument(span)));
 
         out
     }
@@ -416,13 +480,16 @@ where
     /// # Examples
     ///
     /// ```rust
+    /// use std::num::NonZeroUsize;
+    ///
     /// use ferx::Subject;
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let a: Subject<i32, String> = Subject::new(16);
-    ///     let b: Subject<i32, String> = Subject::new(16);
-    ///     let combined = a.merge(16, &b);
+    ///     let capacity = NonZeroUsize::new(16).unwrap();
+    ///     let a: Subject<i32, String> = Subject::new(capacity);
+    ///     let b: Subject<i32, String> = Subject::new(capacity);
+    ///     let combined = a.merge(capacity, &b);
     ///
     ///     let sub = combined.subscribe(|signal| println!("{signal:?}"));
     ///     a.next(1).ok();
@@ -431,9 +498,9 @@ where
     ///     drop(sub);
     /// }
     /// ```
-    pub fn merge(&self, capacity: usize, other: &Subject<T, E>) -> Subject<T, E> {
-        let mut out = Subject::new(capacity);
-        let out_sender = out.sender();
+    #[must_use]
+    pub fn merge(&self, capacity: NonZeroUsize, other: &Self) -> Self {
+        let mut out = Self::new(capacity);
         // Counts how many of the two source arms have completed normally.
         let remaining = Arc::new(AtomicUsize::new(2));
         // Reliable cross-arm cancellation: unlike a bare `AtomicBool`, a
@@ -443,15 +510,27 @@ where
         let (terminated_tx, terminated_rx) = watch::channel(false);
 
         let h1 = spawn_merge_arm(
+            tracing::debug_span!(
+                "ferx_operator",
+                op = "merge",
+                subject = out.id,
+                source = self.id
+            ),
             self.snapshot(),
-            out_sender.clone(),
+            out.clone(),
             remaining.clone(),
             terminated_rx.clone(),
             terminated_tx.clone(),
         );
         let h2 = spawn_merge_arm(
+            tracing::debug_span!(
+                "ferx_operator",
+                op = "merge",
+                subject = out.id,
+                source = other.id
+            ),
             other.snapshot(),
-            out_sender,
+            out.clone(),
             remaining,
             terminated_rx,
             terminated_tx,
@@ -463,8 +542,9 @@ where
 }
 
 fn spawn_merge_arm<T, E>(
+    span: tracing::Span,
     snapshot: SourceSnapshot<T, E>,
-    out_sender: broadcast::Sender<ChannelSignal<T, E>>,
+    out: Subject<T, E>,
     remaining: Arc<AtomicUsize>,
     mut terminated_rx: watch::Receiver<bool>,
     terminated_tx: watch::Sender<bool>,
@@ -473,7 +553,8 @@ where
     T: Clone + Send + 'static,
     E: Clone + Send + 'static,
 {
-    tokio::spawn(async move {
+    tokio::spawn(
+        async move {
         let mut rx = match snapshot {
             SourceSnapshot::Live { receiver, .. } => receiver,
             // The source already ended before this merge arm started; settle
@@ -491,7 +572,7 @@ where
                     }
                 });
                 if is_first {
-                    let _ = out_sender.send(Some(Err(e)));
+                    let _ = out.send(Some(Err(e)));
                 }
                 return;
             }
@@ -499,8 +580,10 @@ where
                 terminal: TerminalState::Complete,
                 ..
             } => {
-                if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    let _ = out_sender.send(None);
+                // Release (not AcqRel): nothing from the sibling arm needs to
+                // be observed here, this is just "give up my share of the count".
+                if remaining.fetch_sub(1, Ordering::Release) == 1 {
+                    let _ = out.send(None);
                 }
                 return;
             }
@@ -514,9 +597,7 @@ where
                 msg = rx.recv() => {
                     match msg {
                         Ok(Some(Ok(t))) => {
-                            if out_sender.send(Some(Ok(t))).is_err() {
-                                break;
-                            }
+                            let _ = out.send(Some(Ok(t)));
                         }
                         Ok(Some(Err(e))) => {
                             // Only the first arm to observe an error forwards it.
@@ -529,14 +610,15 @@ where
                                 }
                             });
                             if is_first {
-                                let _ = out_sender.send(Some(Err(e)));
+                                let _ = out.send(Some(Err(e)));
                             }
                             break;
                         }
                         Ok(None) => {
                             // Only the arm that observes the count drop to 0 signals completion.
-                            if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                                let _ = out_sender.send(None);
+                            // Release (not AcqRel): same reasoning as the Terminated{Complete} arm above.
+                            if remaining.fetch_sub(1, Ordering::Release) == 1 {
+                                let _ = out.send(None);
                             }
                             break;
                         }
@@ -554,5 +636,7 @@ where
                 }
             }
         }
-    })
+        }
+        .instrument(span),
+    )
 }

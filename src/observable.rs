@@ -1,15 +1,22 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::stream::unfold;
 use tokio::sync::oneshot;
 use tokio_stream::{Stream, StreamExt};
+use tracing::Instrument;
 
 use crate::signal::{ChannelSignal, Signal, is_terminal, run_guarded};
 use crate::subscription::{Subscription, spawn_supervised};
 
 type BoxChannelStream<T, E> = Pin<Box<dyn Stream<Item = ChannelSignal<T, E>> + Send>>;
+
+/// Distinguishes one `subscribe_async` call's spawned task from another's in
+/// tracing spans; `Observable` itself has no persistent identity to reuse
+/// since every subscription gets an independent run of the factory.
+static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A cold observable: the factory runs once per subscriber, giving each its
 /// own independent sequence from the start. Unlike [`Subject`](crate::Subject),
@@ -79,8 +86,12 @@ where
     {
         let mut stream = (self.factory)();
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        let span = tracing::debug_span!(
+            "ferx_observable_subscribe",
+            subscription = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed)
+        );
 
-        let abort = spawn_supervised(async move {
+        let fut = async move {
             loop {
                 tokio::select! {
                     biased;
@@ -100,7 +111,9 @@ where
                     }
                 }
             }
-        });
+        };
+
+        let abort = spawn_supervised(fut.instrument(span));
 
         Subscription {
             cancel: Some(cancel_tx),

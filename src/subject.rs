@@ -1,14 +1,21 @@
 use std::future::Future;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 use crate::error::SendError;
 use crate::signal::{
     ChannelSignal, NoReplay, Signal, SubjectPolicy, TerminalState, is_terminal, run_guarded,
 };
 use crate::subscription::{Subscription, spawn_supervised};
+
+/// Distinguishes one `Subject`'s log/span output from another's; assigned
+/// once per `Subject::new` call, shared by every clone.
+static NEXT_SUBJECT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Aborts background operator tasks once no `Subject` clone references them
 /// anymore, so operator stages don't outlive their output handle.
@@ -61,11 +68,13 @@ pub(crate) enum SourceSnapshot<T, E> {
 /// # Examples
 ///
 /// ```rust
+/// use std::num::NonZeroUsize;
+///
 /// use ferx::Subject;
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     let subject: Subject<i32, String> = Subject::new(16);
+///     let subject: Subject<i32, String> = Subject::new(NonZeroUsize::new(16).unwrap());
 ///     let sub = subject.subscribe(|signal| println!("{signal:?}"));
 ///
 ///     subject.next(1).ok();
@@ -80,6 +89,9 @@ pub struct Subject<T, E, P: SubjectPolicy<T> = NoReplay> {
     // Shared so every clone keeps an operator-stage task alive; only the
     // last clone being dropped aborts it.
     task_guard: Option<Arc<TaskGuard>>,
+    // Identifies this subject (shared by every clone) in tracing spans, so
+    // logs from concurrently running subjects can be told apart.
+    pub(crate) id: u64,
 }
 
 impl<T, E, P: SubjectPolicy<T>> Clone for Subject<T, E, P> {
@@ -88,6 +100,7 @@ impl<T, E, P: SubjectPolicy<T>> Clone for Subject<T, E, P> {
             sender: self.sender.clone(),
             state: self.state.clone(),
             task_guard: self.task_guard.clone(),
+            id: self.id,
         }
     }
 }
@@ -99,13 +112,9 @@ where
     P: SubjectPolicy<T>,
 {
     /// Creates a new hot `Subject` with the given channel capacity.
-    ///
-    /// # Panics
-    /// Panics if `capacity` is 0; a broadcast channel needs room for at
-    /// least one in-flight value.
-    pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "Subject capacity must be greater than 0");
-        let (sender, _) = broadcast::channel(capacity);
+    #[must_use]
+    pub fn new(capacity: NonZeroUsize) -> Self {
+        let (sender, _) = broadcast::channel(capacity.get());
         Self {
             sender,
             state: Arc::new(Mutex::new(SubjectState {
@@ -113,6 +122,7 @@ where
                 buffer: P::Buffer::default(),
             })),
             task_guard: None,
+            id: NEXT_SUBJECT_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -132,7 +142,9 @@ where
     ///
     /// Returns the number of subscribers the value was delivered to, or
     /// `Ok(0)` without sending anything if this subject already terminated.
-    /// Errors only if there are no active subscribers at all.
+    ///
+    /// # Errors
+    /// Returns [`SendError::NoReceivers`] if there are no active subscribers.
     pub fn next(&self, value: T) -> Result<usize, SendError> {
         self.send(Some(Ok(value)))
     }
@@ -140,6 +152,9 @@ where
     /// Emits `OnError(err)`, terminating the sequence for all subscribers.
     ///
     /// A no-op (returns `Ok(0)`) if this subject already terminated.
+    ///
+    /// # Errors
+    /// Returns [`SendError::NoReceivers`] if there are no active subscribers.
     pub fn error(&self, err: E) -> Result<usize, SendError> {
         self.send(Some(Err(err)))
     }
@@ -147,30 +162,47 @@ where
     /// Emits `OnCompleted`, terminating the sequence for all subscribers.
     ///
     /// A no-op (returns `Ok(0)`) if this subject already terminated.
+    ///
+    /// # Errors
+    /// Returns [`SendError::NoReceivers`] if there are no active subscribers.
     pub fn complete(&self) -> Result<usize, SendError> {
         self.send(None)
     }
 
-    fn send(&self, wire: ChannelSignal<T, E>) -> Result<usize, SendError> {
-        let mut state = self.state.lock().unwrap();
+    /// Emits a raw `ChannelSignal` value, updating the terminal-state lock first.
+    /// `pub(crate)` (not private) so operators can forward through it
+    /// directly instead of through the `sender()` escape hatch, which would
+    /// silently desync `state.terminal` from what's actually on the channel.
+    pub(crate) fn send(&self, channel_signal: ChannelSignal<T, E>) -> Result<usize, SendError> {
+        let mut state = self.state.lock().expect("ferx: state mutex poisoned");
         if state.terminal.is_some() {
             // Already terminated: ignore further next()/error()/complete()
             // calls, matching the Rx `Subject` contract.
             return Ok(0);
         }
-        match &wire {
+        match &channel_signal {
             Some(Ok(t)) => P::record(&mut state.buffer, t),
             Some(Err(e)) => state.terminal = Some(TerminalState::Error(e.clone())),
             None => state.terminal = Some(TerminalState::Complete),
         }
-        self.sender.send(wire).map_err(|_| SendError::NoReceivers)
+        self.sender
+            .send(channel_signal)
+            .map_err(|_| SendError::NoReceivers)
     }
 
     /// Returns a clone of the underlying [`broadcast::Sender`], for direct
     /// use instead of [`next`](Subject::next)/[`error`](Subject::error)/
     /// [`complete`](Subject::complete). See [`ChannelSignal`] for the value
-    /// type it carries. Sending through it bypasses this subject's
-    /// terminal-state tracking.
+    /// type it carries.
+    ///
+    /// Sending through it bypasses this subject's terminal-state tracking:
+    /// a value sent this way is never recorded, so if it's a terminal one
+    /// (`None`/`Some(Err(_))`), a subscriber that subscribes *afterward*
+    /// won't be told this subject already ended, and will wait on a
+    /// receiver that will never get anything (`broadcast` doesn't replay to
+    /// receivers created after the fact). Safe to use for `OnNext` values,
+    /// or when no subscriber will ever subscribe after this subject ends.
+    #[must_use]
     pub fn sender(&self) -> broadcast::Sender<ChannelSignal<T, E>> {
         self.sender.clone()
     }
@@ -180,7 +212,7 @@ where
     /// lock as `send`, so nothing can terminate (or emit) in the gap between
     /// the check and subscribing.
     pub(crate) fn snapshot(&self) -> SourceSnapshot<T, E> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().expect("ferx: state mutex poisoned");
         let replay = P::replay(&state.buffer);
         match &state.terminal {
             Some(terminal) => SourceSnapshot::Terminated {
@@ -220,12 +252,14 @@ where
     {
         match self.snapshot() {
             SourceSnapshot::Terminated { replay, terminal } => {
-                let abort = spawn_supervised(async move {
+                let span = tracing::debug_span!("ferx_subscribe", subject = self.id);
+                let fut = async move {
                     for value in replay {
                         handler(Signal::Next(value)).await;
                     }
                     handler(terminal.to_signal()).await;
-                });
+                };
+                let abort = spawn_supervised(fut.instrument(span));
                 Subscription {
                     cancel: None,
                     abort: Some(abort),
@@ -234,8 +268,9 @@ where
             SourceSnapshot::Live { replay, receiver } => {
                 let mut rx = receiver;
                 let (cancel_tx, mut cancel_rx) = oneshot::channel();
+                let span = tracing::debug_span!("ferx_subscribe", subject = self.id);
 
-                let abort = spawn_supervised(async move {
+                let fut = async move {
                     for value in replay {
                         handler(Signal::Next(value)).await;
                     }
@@ -271,7 +306,9 @@ where
                             }
                         }
                     }
-                });
+                };
+
+                let abort = spawn_supervised(fut.instrument(span));
 
                 Subscription {
                     cancel: Some(cancel_tx),

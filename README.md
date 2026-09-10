@@ -32,14 +32,17 @@ Reach for plain `futures::Stream`/`tokio-stream` when a single pull-based pipeli
 ## Quick start
 
 ```rust
+use std::num::NonZeroUsize;
+
 use ferx::{Signal, Subject};
 
 #[tokio::main]
 async fn main() {
-    let source: Subject<i32, String> = Subject::new(16);
+    let capacity = NonZeroUsize::new(16).unwrap();
+    let source: Subject<i32, String> = Subject::new(capacity);
 
-    let evens = source.filter(16, |n| n % 2 == 0);
-    let doubled = evens.map(16, |n| n * 2);
+    let evens = source.filter(capacity, |n| n % 2 == 0);
+    let doubled = evens.map(capacity, |n| n * 2);
 
     let sub = doubled.subscribe(|signal| match signal {
         Signal::Next(n) => println!("next: {n}"),
@@ -66,7 +69,8 @@ A hot source: values are emitted regardless of subscriber count, and late subscr
 Once a `Subject` has emitted `OnError`/`OnCompleted`, it remembers that: further `next()`/`error()`/`complete()` calls are silently ignored, and any subscriber that subscribes afterward immediately receives that stored terminal signal instead of waiting on a channel that will never deliver it, matching the [Rx `Subject`/`PublishSubject` contract](https://reactivex.io/documentation/subject.html). This only applies to signals sent via `next`/`error`/`complete`; using the raw `sender()` bypasses it.
 
 ```rust
-let subject: Subject<i32, String> = Subject::new(/* channel capacity */ 16);
+let capacity = NonZeroUsize::new(16).unwrap(); // channel capacity, can't be 0
+let subject: Subject<i32, String> = Subject::new(capacity);
 
 subject.next(42).ok();               // OnNext
 subject.error("boom".to_string()).ok(); // OnError, terminates the sequence
@@ -94,27 +98,27 @@ Both return a `#[must_use] Subscription`. Dropping it requests cancellation and 
 Each operator spawns a background task that reads from the source subject and re-publishes into a new one you get back. Except for `take`/`take_while` (which synthesize their own `OnCompleted`), `OnError`/`OnCompleted` always pass through untouched.
 
 ```rust
-let doubled: Subject<i32, String> = subject.map(16, |n| n * 2);
+let doubled: Subject<i32, String> = subject.map(capacity, |n| n * 2);
 // e.g. subject emits  1, 2, 3, 4, 5,  then completes
 //   -> doubled emits  2, 4, 6, 8, 10, then completes
 
-let evens: Subject<i32, String> = subject.filter(16, |n| n % 2 == 0);
+let evens: Subject<i32, String> = subject.filter(capacity, |n| n % 2 == 0);
 // e.g. subject emits 1, 2, 3, 4, 5, then completes
 //   -> evens emits      2,    4,    then completes
 
-let first_three: Subject<i32, String> = subject.take(16, 3);
+let first_three: Subject<i32, String> = subject.take(capacity, 3);
 // e.g. subject emits     1, 2, 3, 4, 5, then completes
 //   -> first_three emits 1, 2, 3,       then completes (synthesized right after the 3rd item)
 
-let until_ten: Subject<i32, String> = subject.take_while(16, |n| *n < 10);
+let until_ten: Subject<i32, String> = subject.take_while(capacity, |n| *n < 10);
 // e.g. subject emits   1, 5, 9, 10, 2, then completes
 //   -> until_ten emits 1, 5, 9,        then completes (synthesized on the first failing value; 10 isn't forwarded)
 
-let after_first_two: Subject<i32, String> = subject.skip(16, 2);
+let after_first_two: Subject<i32, String> = subject.skip(capacity, 2);
 // e.g. subject emits         1, 2, 3, 4, 5, then completes
 //   -> after_first_two emits       3, 4, 5, then completes
 
-let combined: Subject<i32, String> = subject.merge(16, &other_subject);
+let combined: Subject<i32, String> = subject.merge(capacity, &other_subject);
 // e.g.       subject emits 1, 3       and completes; 
 //      other_subject emits 2, 4       and completes
 //   -> combined emits      1, 2, 3, 4 (interleaved by arrival order), then completes once both sources have
@@ -163,7 +167,7 @@ pub enum Signal<T, E> {
 - **Operator task lifetime**: `Subject` operators spawn one or more background tasks tied to the returned `Subject`'s lifetime; once every clone of it is dropped, the task(s) are aborted so they don't outlive their output or keep holding a receiver on the source(s).
 - **Cold vs hot**: `Observable`'s factory reruns per subscriber with no shared channel, so there's no lag/backpressure policy to speak of on the cold side; each subscriber simply drives its own stream at its own pace.
 - **Lagged subscribers**: if a subscriber falls behind the broadcast channel's capacity, delivery to that subscriber (or operator stage) simply stops. The wire format (`Option<Result<T, E>>`) has no slot for a transport error distinct from your own `E`, so this is not surfaced through `Signal::Error`.
-- **Errors**: typed via `thiserror`, `#[non_exhaustive]` so new variants aren't breaking changes. `Subject::new` panics if `capacity` is 0.
+- **Errors**: typed via `thiserror`, `#[non_exhaustive]` so new variants aren't breaking changes. `Subject::new`'s capacity is a `NonZeroUsize`, so a zero capacity is a compile error, not a runtime panic.
 
 ## Observability
 
@@ -182,8 +186,8 @@ What gets logged, and at what level:
 
 | Level | Event |
 | ----- | ----- |
-| `error` | A `map`/`filter`/`take_while`/`subscribe` closure panicked (includes the panic message); that stage stops. |
+| `error` | A `map`/`filter`/`take_while`/`subscribe` closure panicked (includes the panic message); that stage stops. Also logged if a `subscribe_async` handler panics (via the spawned task's `JoinError`, message not included). |
 | `warn` | A subscriber or operator stage fell behind the channel's capacity (lagged) and stopped receiving. |
 | `debug` | A `Subject` (or all its clones) was dropped without an explicit `error()`/`complete()` call, so a stage or subscriber ends with no terminal `Signal`. |
 
-All events are scoped under the `ferx` target, so you can filter on it, e.g. `RUST_LOG=ferx=debug`.
+All events are scoped under the `ferx` target, so you can filter on it, e.g. `RUST_LOG=ferx=debug`. Events emitted from a subscriber or operator stage's background task carry a span (`ferx_subscribe`/`ferx_operator`/`ferx_observable_subscribe`) with a `subject`/`subscription` id field, so logs from concurrently running subjects can be told apart.

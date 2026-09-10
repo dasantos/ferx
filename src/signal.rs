@@ -24,15 +24,15 @@ pub(crate) enum TerminalState<E> {
 impl<E: Clone> TerminalState<E> {
     pub(crate) fn to_channel_signal<T>(&self) -> ChannelSignal<T, E> {
         match self {
-            TerminalState::Error(e) => Some(Err(e.clone())),
-            TerminalState::Complete => None,
+            Self::Error(e) => Some(Err(e.clone())),
+            Self::Complete => None,
         }
     }
 
     pub(crate) fn to_signal<T>(&self) -> Signal<T, E> {
         match self {
-            TerminalState::Error(e) => Signal::Error(e.clone()),
-            TerminalState::Complete => Signal::Complete,
+            Self::Error(e) => Signal::Error(e.clone()),
+            Self::Complete => Signal::Complete,
         }
     }
 }
@@ -78,9 +78,9 @@ pub enum Signal<T, E> {
 impl<T, E> From<ChannelSignal<T, E>> for Signal<T, E> {
     fn from(wire: ChannelSignal<T, E>) -> Self {
         match wire {
-            Some(Ok(t)) => Signal::Next(t),
-            Some(Err(e)) => Signal::Error(e),
-            None => Signal::Complete,
+            Some(Ok(t)) => Self::Next(t),
+            Some(Err(e)) => Self::Error(e),
+            None => Self::Complete,
         }
     }
 }
@@ -122,5 +122,39 @@ impl<T: Clone> SubjectPolicy<T> for NoReplay {
 
     fn replay(_buffer: &Self::Buffer) -> Vec<T> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_terminal_matches_error_and_complete_only() {
+        let next: ChannelSignal<i32, String> = Some(Ok(1));
+        let error: ChannelSignal<i32, String> = Some(Err("boom".to_string()));
+        let complete: ChannelSignal<i32, String> = None;
+
+        assert!(!is_terminal(&next));
+        assert!(is_terminal(&error));
+        assert!(is_terminal(&complete));
+    }
+
+    #[test]
+    fn run_guarded_returns_the_closure_result_on_success() {
+        assert_eq!(run_guarded("test", || 42), Some(42));
+    }
+
+    #[test]
+    fn run_guarded_extracts_a_str_panic_message() {
+        // run_guarded catches the panic itself; it never propagates here.
+        let result = run_guarded::<()>("test", || panic!("boom"));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn run_guarded_handles_a_non_string_panic_payload() {
+        let result = run_guarded::<()>("test", || std::panic::panic_any(42_i32));
+        assert_eq!(result, None);
     }
 }

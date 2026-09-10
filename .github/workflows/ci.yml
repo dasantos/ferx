@@ -20,7 +20,7 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings -W clippy::pedantic
       - name: Test
         run: cargo test --all-targets
 
@@ -35,6 +35,6 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings -W clippy::pedantic
       - name: Test
         run: cargo test --all-targets

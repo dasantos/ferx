@@ -56,3 +56,26 @@ jobs:
         with:
           files: lcov.info
           fail_ci_if_error: true
+
+  benchmark:
+    runs-on: ubuntu-latest
+    # Writes to the gh-pages to track history (only runs on main, just to have an idea of performance changes and keep track of them)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run benchmarks
+        run: cargo bench --bench operators -- --output-format bencher | tee output.txt
+      - name: Track benchmark results and alert on regressions
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: "cargo"
+          output-file-path: output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: "120%"
+          comment-on-alert: true
+          fail-on-alert: true

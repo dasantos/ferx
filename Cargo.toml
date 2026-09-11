@@ -19,6 +19,16 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+criterion = "0.5"
+
+[[bench]]
+name = "operators"
+harness = false
+
+[profile.bench]
+inherits = "release"
+debug = true
+strip = false
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

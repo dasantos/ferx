@@ -67,6 +67,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Clear stale Criterion baseline data
+        # github-action-benchmark tracks history across runs on its own via
+        # gh-pages; Criterion's own "base" baseline comparison isn't needed
+        # here, and a cached, partial target/criterion dir makes it error.
+        run: rm -rf target/criterion
       - name: Run benchmarks
         run: cargo bench --bench operators -- --output-format bencher | tee output.txt
       - name: Track benchmark results and alert on regressions

@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789125123780,
+  "lastUpdate": 1789127044430,
   "repoUrl": "https://github.com/dasantos/ferx",
   "entries": {
     "Benchmark": [
@@ -208,6 +208,48 @@ window.BENCHMARK_DATA = {
           {
             "name": "next_after_termination",
             "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "danielsantos5589@gmail.com",
+            "name": "Daniel Santos",
+            "username": "dasantos"
+          },
+          "committer": {
+            "email": "danielsantos5589@gmail.com",
+            "name": "Daniel Santos",
+            "username": "dasantos"
+          },
+          "distinct": true,
+          "id": "243919df1e81dd5fef79ebe3c54cff26bd628c64",
+          "message": "chore: set bench threshold to 130%",
+          "timestamp": "2026-09-11T13:10:50+02:00",
+          "tree_id": "427a6d851129ada067b120b94957d8d0167cbd9c",
+          "url": "https://github.com/dasantos/ferx/commit/243919df1e81dd5fef79ebe3c54cff26bd628c64"
+        },
+        "date": 1789127043370,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "next_no_receivers",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "next_with_a_receiver",
+            "value": 23,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "next_after_termination",
+            "value": 4,
             "range": "± 0",
             "unit": "ns/iter"
           }
